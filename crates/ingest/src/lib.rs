@@ -169,10 +169,22 @@ impl Ingestor {
     /// safe). Intended to run as its own task/process.
     pub async fn run(self, interval: Duration, page_limit: u32) {
         loop {
-            match self.poll_once(page_limit).await {
-                Ok(n) if n > 0 => tracing::debug!(processed = n, "ingest poll"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = ?e, "ingest poll failed; will retry"),
+            // Drain a backlog within one interval, bounded like `Supervisor::tick`.
+            for _ in 0..Supervisor::MAX_PAGES_PER_TICK {
+                match self.poll_once(page_limit).await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::debug!(processed = n, "ingest poll");
+                        }
+                        if !page_was_full(n, page_limit) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "ingest poll failed; will retry");
+                        break;
+                    }
+                }
             }
             tokio::time::sleep(interval).await;
         }
@@ -231,6 +243,19 @@ impl Ingestor {
         let ledger = rec.transaction.as_ref().and_then(|t| t.ledger);
         let tx_hash = rec.transaction_hash.clone().unwrap_or_default();
 
+        // A bad TOID would corrupt the (tx_hash, operation_index) dedup key — skip, never guess.
+        let toid = decode_toid(&rec.id, plausible_max_ledger())
+            .filter(|t| ledger.is_none_or(|l| i64::from(t.ledger) == l));
+        let Some(toid) = toid else {
+            tracing::warn!(
+                op_id = %rec.id,
+                tx_hash = %tx_hash,
+                ?ledger,
+                "implausible Horizon TOID; skipping record"
+            );
+            return Ok(Processed::Skipped);
+        };
+
         let dep = NewDeposit {
             wallet_id: self.wallet_id,
             address_id,
@@ -240,7 +265,7 @@ impl Ingestor {
             source_account: rec.from.clone(),
             destination_account: rec.to_muxed.clone().or_else(|| rec.to.clone()),
             stellar_tx_hash: tx_hash,
-            operation_index: operation_index_from_toid(&rec.id).unwrap_or(0),
+            operation_index: toid.operation_index,
             horizon_op_id: rec.id.clone(),
             ledger,
             memo_id,
@@ -435,22 +460,84 @@ impl Ingestor {
     }
 }
 
-/// Extract the operation index from a Horizon TOID (Transaction Operation ID).
+/// Whether a page came back full, meaning more records may be waiting behind it.
+fn page_was_full(records: usize, page_limit: u32) -> bool {
+    page_limit > 0 && records >= page_limit as usize
+}
+
+/// Unix time of pubnet genesis (2015-09-30T00:00:00Z, rounded down so the bound stays generous).
+const STELLAR_GENESIS_UNIX: u64 = 1_443_571_200;
+/// Ledger ceiling that holds regardless of the host clock: seconds from genesis to 2026-01-01.
+const LEDGER_CEILING_FLOOR: u32 = 323_654_400;
+/// stellar-core's `MAX_OPS_PER_TX`: an operation index is always in `0..100`.
+const MAX_OPS_PER_TX: u64 = 100;
+
+/// A decoded Horizon operation TOID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Toid {
+    pub ledger: u32,
+    /// 1-based application order of the transaction within its ledger.
+    pub tx_order: u32,
+    /// 0-based index of the operation within its transaction.
+    pub operation_index: i32,
+}
+
+/// The highest ledger sequence that could plausibly exist now.
 ///
-/// A TOID has the format: `{ledger}-{tx_index}-{op_index}`, where:
-/// - `ledger` is the ledger sequence number
-/// - `tx_index` is the transaction's index within that ledger
-/// - `op_index` is the operation's index within that transaction
+/// Assumes at most one ledger per second (5× faster than the ~5 s close target), and never drops
+/// below [`LEDGER_CEILING_FLOOR`] so a host clock set in the past cannot reject real deposits.
+pub fn plausible_max_ledger() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let by_clock = u32::try_from(now.saturating_sub(STELLAR_GENESIS_UNIX)).unwrap_or(u32::MAX);
+    by_clock.max(LEDGER_CEILING_FLOOR)
+}
+
+/// Decode a Horizon operation TOID, rejecting any field outside its real-world range.
 ///
-/// Returns `None` if the TOID format is invalid or parsing fails.
-pub fn operation_index_from_toid(toid: &str) -> Option<i32> {
-    // Split on hyphens and take the third component (operation index)
-    let parts: Vec<&str> = toid.split('-').collect();
-    if parts.len() != 3 {
+/// A TOID is a positive `int64` written as a decimal string (e.g. `"12884905985"`), laid out as
+/// in stellar/go `toid/main.go` (`LedgerShift = 32`, `TransactionShift = 12`):
+///
+/// ```text
+///  bit 63       32 31               12 11          0
+///  ┌──────────────┬───────────────────┬─────────────┐
+///  │ ledger (32)  │ tx order (20)     │ op order(12)│
+///  └──────────────┴───────────────────┴─────────────┘
+/// ```
+///
+/// Horizon's operations processor builds it as `toid.New(ledger, tx.Index, opIndex + 1)`, so for
+/// an operation: `ledger` is in `1..=max_ledger`, `tx order` starts at 1, and `op order` is
+/// `1..=MAX_OPS_PER_TX` (0 would be the transaction's own TOID, not an operation's).
+pub fn decode_toid(toid: &str, max_ledger: u32) -> Option<Toid> {
+    // Canonical digits only — `parse` alone would accept "+1" and leading signs.
+    if toid.is_empty() || !toid.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    let packed = u64::try_from(toid.parse::<i64>().ok()?).ok()?;
+    let ledger = (packed >> 32) as u32;
+    let tx_order = ((packed >> 12) & 0xF_FFFF) as u32;
+    let op_order = packed & 0xFFF;
+    if ledger == 0 || ledger > max_ledger || tx_order == 0 {
+        return None;
+    }
+    if op_order == 0 || op_order > MAX_OPS_PER_TX {
+        return None;
+    }
+    Some(Toid {
+        ledger,
+        tx_order,
+        operation_index: (op_order - 1) as i32,
+    })
+}
 
-    parts[2].parse::<i32>().ok()
+/// Extract the 0-based operation index from a Horizon operation TOID.
+///
+/// Returns `None` for anything that does not decode to a plausible operation (see
+/// [`decode_toid`]) — never a guessed or out-of-range index.
+pub fn operation_index_from_toid(toid: &str) -> Option<i32> {
+    decode_toid(toid, plausible_max_ledger()).map(|t| t.operation_index)
 }
 
 /// Errors from the ingest worker.
@@ -563,7 +650,8 @@ impl Supervisor {
         }
     }
 
-    /// One supervision pass: poll every wallet on this network once.
+    /// One supervision pass: poll every wallet on this network, draining each wallet's backlog
+    /// page by page up to [`Self::MAX_PAGES_PER_TICK`].
     ///
     /// Wallets are polled CONCURRENTLY (bounded by [`Self::MAX_CONCURRENT_POLLS`]), not one at a
     /// time. Sequential polling meant a single slow/unfunded wallet's Horizon round-trip (or
@@ -613,10 +701,28 @@ impl Supervisor {
                 )
                 .with_webhooks(webhooks)
                 .with_tracker(tracker);
-                let result = ingestor.poll_once(page_limit).await;
-                // Record the attempt regardless of outcome, so a wallet whose polls keep failing
-                // still backs off instead of being retried at full rate forever.
-                let _ = store_for_mark.mark_polled(w.id).await;
+                // Drain a backlog page by page; each page persists its own cursor (crash-safe).
+                let mut total = 0;
+                let mut result = Ok(0);
+                for _ in 0..Self::MAX_PAGES_PER_TICK {
+                    let page = ingestor.poll_once(page_limit).await;
+                    // Record the attempt regardless of outcome, so a wallet whose polls keep
+                    // failing still backs off instead of being retried at full rate forever.
+                    let _ = store_for_mark.mark_polled(w.id).await;
+                    match page {
+                        Ok(n) => {
+                            total += n;
+                            result = Ok(total);
+                            if !page_was_full(n, page_limit) {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
                 (w.id, result)
             });
         }
@@ -636,6 +742,15 @@ impl Supervisor {
 
     /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
     const MAX_CONCURRENT_POLLS: usize = 20;
+
+    /// Upper bound on pages one wallet may fetch in a single [`Supervisor::tick`].
+    ///
+    /// Fairness tradeoff: a wallet keeps its concurrency permit while it drains, so an unbounded
+    /// drain would let one recovering wallet pin a permit for its whole backlog. At the default
+    /// `INGEST_PAGE_LIMIT` of 50 this drains up to 500 records per wallet per tick — enough to
+    /// clear a typical outage backlog in one or two ticks — while costing at most 10 Horizon
+    /// round-trips on one of 20 permits, so the other permits keep serving every other wallet.
+    const MAX_PAGES_PER_TICK: usize = 10;
 
     /// Activity-based backoff tiers. A wallet that saw a deposit within `ACTIVE_AFTER_SECS` is
     /// polled every tick; quieter wallets are polled progressively less often. Deposit latency for
@@ -818,42 +933,36 @@ mod tests {
 
     #[test]
     fn operation_index_from_toid_parses_correctly() {
-        // Standard TOID format: ledger-tx_index-op_index
-        assert_eq!(operation_index_from_toid("12345-1-0"), Some(0));
-        assert_eq!(operation_index_from_toid("12345-1-1"), Some(1));
-        assert_eq!(operation_index_from_toid("12345-10-5"), Some(5));
-        assert_eq!(operation_index_from_toid("999999999-0-99"), Some(99));
+        // Packed Horizon TOIDs: (ledger << 32) | (tx_order << 12) | (op_index + 1).
+        assert_eq!(operation_index_from_toid("12884905985"), Some(0)); // ledger 3, tx 1, op 1
+        assert_eq!(operation_index_from_toid("12884905986"), Some(1));
+        assert_eq!(operation_index_from_toid("53021371310086"), Some(5));
+        assert_eq!(operation_index_from_toid("4294963001036900"), Some(99));
     }
 
     #[test]
     fn operation_index_from_toid_handles_invalid_format() {
-        // Missing parts
-        assert_eq!(operation_index_from_toid("12345-1"), None);
-        assert_eq!(operation_index_from_toid("12345"), None);
-        assert_eq!(operation_index_from_toid(""), None);
-
-        // Too many parts
-        assert_eq!(operation_index_from_toid("12345-1-0-extra"), None);
-
-        // Non-numeric operation index
-        assert_eq!(operation_index_from_toid("12345-1-abc"), None);
-        assert_eq!(operation_index_from_toid("12345-1-"), None);
+        for bad in [
+            "",
+            "abc",
+            "12345-1-0",
+            "+12884905985",
+            "-12884905985",
+            "9223372036854775808",
+        ] {
+            assert_eq!(operation_index_from_toid(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
     fn operation_index_from_toid_handles_edge_cases() {
-        // A real Horizon TOID's operation index is never negative, and a literal "-1" segment
-        // splits the string into 4 hyphen-delimited parts (not 3), so this is correctly rejected
-        // by the same "exactly 3 parts" check that rejects any other malformed TOID shape.
-        assert_eq!(operation_index_from_toid("12345-1--1"), None);
-
-        // Large numbers within i32 range
-        assert_eq!(
-            operation_index_from_toid("12345-1-2147483647"),
-            Some(i32::MAX)
-        );
-
-        // Numbers outside i32 range should fail
-        assert_eq!(operation_index_from_toid("12345-1-2147483648"), None);
+        // op order 0 is the transaction's own TOID; op order 101 exceeds MAX_OPS_PER_TX.
+        assert_eq!(operation_index_from_toid("12884905984"), None);
+        assert_eq!(operation_index_from_toid("12884906085"), None);
+        // tx order 0 and ledger 0 are never produced by Horizon.
+        assert_eq!(operation_index_from_toid("12884901889"), None);
+        assert_eq!(operation_index_from_toid("4097"), None);
+        // Ledger i32::MAX is representable but implausible.
+        assert_eq!(operation_index_from_toid("9223372032559812609"), None);
     }
 }
